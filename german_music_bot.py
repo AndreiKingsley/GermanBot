@@ -315,9 +315,21 @@ song_queue = {}
 # Подключение к YouTube API
 youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 
-# Проверка, является ли ссылка плейлистом
+# Проверка, является ли ссылка плейлистом и извлечение ID плейлиста
 def is_playlist(url):
-    return "playlist?list=" in url or "&list=" in url
+    # Ищем параметр list= в URL
+    playlist_match = re.search(r'[?&]list=([^&]+)', url)
+    if playlist_match:
+        return True, playlist_match.group(1)
+    return False, None
+
+# Получение чистого URL видео без параметров плейлиста
+def clean_video_url(url):
+    # Извлекаем video_id из URL
+    video_match = re.search(r'(?:v=|/)([0-9A-Za-z_-]{11}).*', url)
+    if video_match:
+        return f'https://www.youtube.com/watch?v={video_match.group(1)}'
+    return url
 
 # Функция загрузки аудио
 async def download_audio(url, guild_id):
@@ -542,26 +554,105 @@ async def process_play(ctx, url):
         await ctx.send(f"❌ Ошибка при добавлении трека: {str(e)}")
 
 # Функция обработки плейлиста
-async def process_playlist(ctx, url):
+def create_loading_bar(current, total, length=16):
+    """Создает визуальный индикатор загрузки"""
+    filled_length = int(length * current / total)
+    if filled_length == 0:
+        bar = "○" + "┈" * (length - 1)
+    elif filled_length == length:
+        bar = "━" * (length - 1) + "●"
+    else:
+        bar = "━" * (filled_length - 1) + "⦿" + "┈" * (length - filled_length)
+    percent = int(100.0 * current / total)
+    return f"`{bar}` **{percent}%**"
+
+async def process_playlist(ctx, url, shuffle=False):
     """Обрабатывает скачивание и добавление плейлиста в очередь"""
     guild_id = ctx.guild.id
     if guild_id not in song_queue:
         song_queue[guild_id] = []
 
-    await ctx.send("📜 Загружаю плейлист, подождите...")
+    loading_msg = await ctx.send(
+        "🎵 **Загрузка плейлиста**\n"
+        f"{'┄' * 28}\n"
+        "⏳ Получение информации..."
+    )
 
-    ydl_opts = {"quiet": True, "extract_flat": True, "playlistend": 20}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    ydl_opts = {
+        "quiet": True,
+        "extract_flat": True,
+        "playlistend": 50,  # Увеличиваем лимит треков
+        "ignoreerrors": True
+    }
 
-    for entry in info["entries"]:
-        if "url" in entry:
-            song_queue[guild_id].append((entry["url"], entry["title"]))
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            playlist_title = info.get('title', 'Плейлист')
 
-    await ctx.send(f"📥 Добавлено {len(info['entries'])} треков из плейлиста.")
+            if "entries" in info:
+                valid_entries = [entry for entry in info["entries"] if entry is not None and "url" in entry and "title" in entry]
+                total_tracks = len(valid_entries)
 
-    if not ctx.voice_client.is_playing():
-        await play_next(ctx)
+                if total_tracks > 0:
+                    # Обновляем сообщение с названием плейлиста
+                    tracks_word = 'трек' if total_tracks == 1 else 'трека' if 1 < total_tracks < 5 else 'треков'
+                    await loading_msg.edit(
+                        content=(
+                            f"🎵 **{playlist_title}**\n"
+                            f"{'─' * 32}\n"
+                            f"⏳ Подготовка плейлиста...\n"
+                            f"📑 Найдено: **{total_tracks}** {tracks_word}"
+                        )
+                    )
+
+                    # Перемешиваем треки если нужно
+                    if shuffle:
+                        import random
+                        random.shuffle(valid_entries)
+
+                    # Добавляем треки в очередь
+                    tracks_added = 0
+                    for entry in valid_entries:
+                        song_queue[guild_id].append((entry["url"], entry["title"]))
+                        tracks_added += 1
+
+                        # Обновляем прогресс-бар каждые 5 треков
+                        if tracks_added % 5 == 0 or tracks_added == total_tracks:
+                            progress_bar = create_loading_bar(tracks_added, total_tracks)
+                            status = "🔀 Перемешивание" if shuffle else "⏳ Загрузка"
+                            await loading_msg.edit(
+                                content=(
+                                    f"🎵 **{playlist_title}**\n"
+                                    f"{'┄' * 28}\n"
+                                    f"{status} треков\n"
+                                    f"{progress_bar}\n"
+                                    f"📥 **{tracks_added}** из **{total_tracks}**"
+                                )
+                            )
+
+                    # Формируем сообщение о результате
+                    tracks_word = 'трек' if tracks_added == 1 else 'трека' if 1 < tracks_added < 5 else 'треков'
+                    mode_text = "🔀 Перемешано" if shuffle else "📑 По порядку"
+                    await loading_msg.edit(
+                        content=(
+                            f"✅ **Плейлист загружен**\n"
+                            f"{'┄' * 28}\n"
+                            f"🎵 **{playlist_title}**\n"
+                            f"📥 **{tracks_added}** {tracks_word} | {mode_text}"
+                        )
+                    )
+
+                    # Начинаем воспроизведение, если ничего не играет
+                    if not ctx.voice_client.is_playing():
+                        await play_next(ctx)
+                else:
+                    await loading_msg.edit(content="❌ В плейлисте нет доступных треков")
+            else:
+                await loading_msg.edit(content="❌ Не удалось загрузить плейлист")
+
+    except Exception as e:
+        await loading_msg.edit(content=f"❌ Ошибка при загрузке плейлиста: {str(e)}")
 
 # Команды
 @bot.command(name="play", aliases=["p"], help="Добавляет трек или плейлист в очередь. Пример: !play <запрос/ссылка>")
@@ -571,7 +662,71 @@ async def play(ctx, *, query: str):
         return
 
     youtube_url_regex = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+")
-    if not youtube_url_regex.match(query):
+    if youtube_url_regex.match(query):
+        is_pl, playlist_id = is_playlist(query)
+        if is_pl:
+            # Если URL содержит и видео, и плейлист
+            video_url = clean_video_url(query)
+            playlist_url = f"https://www.youtube.com/playlist?list={playlist_id}"
+
+            # Создаем кнопки для выбора действия
+            view = discord.ui.View(timeout=30)
+
+            async def button_callback(interaction: discord.Interaction, action: str):
+                if interaction.user != ctx.author:
+                    await interaction.response.send_message("❌ Это не ваша команда!", ephemeral=True)
+                    return
+
+                # Деактивируем все кнопки
+                for item in view.children:
+                    item.disabled = True
+                await interaction.message.edit(view=view)
+
+                if action == "track":
+                    await interaction.response.send_message("🎵 Добавляю текущий трек...")
+                    await process_play(ctx, video_url)
+                elif action == "playlist":
+                    await interaction.response.send_message("📑 Загружаю плейлист...")
+                    await process_playlist(ctx, playlist_url, shuffle=False)
+                elif action == "shuffle":
+                    await interaction.response.send_message("🔀 Загружаю и перемешиваю плейлист...")
+                    await process_playlist(ctx, playlist_url, shuffle=True)
+                else:
+                    await interaction.response.send_message("❌ Операция отменена")
+
+                await interaction.message.delete()
+
+            # Добавляем кнопки
+            track_btn = discord.ui.Button(label="Только текущий трек", style=discord.ButtonStyle.primary, emoji="🎵")
+            track_btn.callback = lambda i: button_callback(i, "track")
+            view.add_item(track_btn)
+
+            playlist_btn = discord.ui.Button(label="Весь плейлист", style=discord.ButtonStyle.success, emoji="📑")
+            playlist_btn.callback = lambda i: button_callback(i, "playlist")
+            view.add_item(playlist_btn)
+
+            shuffle_btn = discord.ui.Button(label="Плейлист (перемешать)", style=discord.ButtonStyle.success, emoji="🔀")
+            shuffle_btn.callback = lambda i: button_callback(i, "shuffle")
+            view.add_item(shuffle_btn)
+
+            cancel_btn = discord.ui.Button(label="Отмена", style=discord.ButtonStyle.danger, emoji="❌")
+            cancel_btn.callback = lambda i: button_callback(i, "cancel")
+            view.add_item(cancel_btn)
+
+            # Отправляем сообщение с кнопками
+            msg = await ctx.send(
+                "🎵 **Обнаружен плейлист!**\nВыберите действие:",
+                view=view
+            )
+
+            # Ожидаем таймаут
+            await view.wait()
+            if not view.is_finished():
+                await msg.delete()
+                await ctx.send("⏰ Время выбора истекло")
+        else:
+            await process_play(ctx, query)
+    else:
         results = search_youtube(query)
         if not results:
             await ctx.send("❌ Ничего не найдено на YouTube.")
