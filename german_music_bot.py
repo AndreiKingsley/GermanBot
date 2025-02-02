@@ -4,6 +4,7 @@ import yt_dlp
 import asyncio
 import os
 import re
+import sqlite3
 from googleapiclient.discovery import build
 
 from _token import TOKEN, YOUTUBE_API_KEY  # Храни API-ключ в _token.py
@@ -19,6 +20,24 @@ song_queue = {}
 # Подключение к YouTube API
 youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 
+# Подключение к SQLite
+def init_db():
+    """Инициализация базы данных SQLite"""
+    conn = sqlite3.connect("music_bot.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS downloaded_tracks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT UNIQUE,
+            title TEXT,
+            file_path TEXT
+        )
+    """)
+    conn.commit()
+    return conn
+
+db_conn = init_db()
+
 # Проверка, является ли ссылка плейлистом
 def is_playlist(url):
     return "playlist?list=" in url or "&list=" in url
@@ -26,6 +45,18 @@ def is_playlist(url):
 # Функция загрузки аудио
 async def download_audio(url, guild_id):
     """Скачивает аудиофайл перед воспроизведением"""
+    # Проверяем, есть ли трек в базе данных
+    cursor = db_conn.cursor()
+    cursor.execute("SELECT file_path FROM downloaded_tracks WHERE url = ?", (url,))
+    result = cursor.fetchone()
+
+    if result:
+        # Если трек уже скачан, возвращаем путь к файлу
+        file_path = result[0]
+        title = cursor.execute("SELECT title FROM downloaded_tracks WHERE url = ?", (url,)).fetchone()[0]
+        return file_path, title
+
+    # Если трек не скачан, скачиваем его
     ydl_opts = {
         "format": "bestaudio/best",
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
@@ -39,8 +70,13 @@ async def download_audio(url, guild_id):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
         filename = ydl.prepare_filename(info).replace(".webm", ".mp3").replace(".m4a", ".mp3")
+        title = info["title"]
 
-    return filename, info["title"]
+    # Сохраняем информацию о треке в базу данных
+    cursor.execute("INSERT INTO downloaded_tracks (url, title, file_path) VALUES (?, ?, ?)", (url, title, filename))
+    db_conn.commit()
+
+    return filename, title
 
 # Функция воспроизведения следующего трека
 async def play_next(ctx):
@@ -128,7 +164,7 @@ async def process_playlist(ctx, url):
         await play_next(ctx)
 
 # Команды
-@bot.command(name="play", aliases=["p"])
+@bot.command(name="play", aliases=["p"], help="Добавляет трек или плейлист в очередь. Пример: !play <запрос/ссылка>")
 async def play(ctx, *, query: str):
     """Добавляет в очередь видео или плейлист"""
     if not await ensure_voice(ctx):
@@ -141,13 +177,14 @@ async def play(ctx, *, query: str):
             await ctx.send("❌ Ничего не найдено на YouTube.")
             return
 
-        view = discord.ui.View()
+        # Создаем кнопки для выбора трека
+        view = discord.ui.View(timeout=30)
         for i, (title, link) in enumerate(results):
-            button = discord.ui.Button(label=f"{i+1}. {title[:40]}", style=discord.ButtonStyle.primary)
+            button = discord.ui.Button(label=f"{i+1}. {title[:40]}", style=discord.ButtonStyle.primary, custom_id=link)
 
-            async def callback(interaction, link=link):
+            async def callback(interaction):
                 await interaction.response.defer()
-                await process_play(ctx, link)
+                await process_play(ctx, interaction.data["custom_id"])
 
             button.callback = callback
             view.add_item(button)
@@ -160,14 +197,14 @@ async def play(ctx, *, query: str):
     else:
         await process_play(ctx, query)
 
-@bot.command(name="skip", aliases=["s"])
+@bot.command(name="skip", aliases=["s"], help="Пропускает текущий трек.")
 async def skip(ctx):
     """Пропускает текущий трек"""
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
         await ctx.send("⏭ Пропускаю трек...")
 
-@bot.command(name="queue", aliases=["q"])
+@bot.command(name="queue", aliases=["q"], help="Показывает текущую очередь треков.")
 async def queue(ctx):
     """Показывает очередь треков"""
     guild_id = ctx.guild.id
@@ -177,21 +214,21 @@ async def queue(ctx):
     else:
         await ctx.send("📭 Очередь пуста!")
 
-@bot.command(name="pause")
+@bot.command(name="pause", help="Ставит воспроизведение на паузу.")
 async def pause(ctx):
     """Ставит текущий трек на паузу"""
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.pause()
         await ctx.send("⏸ Музыка на паузе!")
 
-@bot.command(name="resume")
+@bot.command(name="resume", help="Возобновляет воспроизведение.")
 async def resume(ctx):
     """Возобновляет воспроизведение"""
     if ctx.voice_client and ctx.voice_client.is_paused():
         ctx.voice_client.resume()
         await ctx.send("▶ Продолжаю воспроизведение!")
 
-@bot.command(name="stop")
+@bot.command(name="stop", help="Останавливает воспроизведение и очищает очередь.")
 async def stop(ctx):
     """Останавливает воспроизведение и очищает очередь"""
     if ctx.voice_client:
@@ -199,13 +236,23 @@ async def stop(ctx):
         song_queue[ctx.guild.id] = []
         await ctx.send("⏹ Воспроизведение остановлено и очередь очищена!")
 
-@bot.command(name="remove")
+@bot.command(name="remove", help="Удаляет трек из очереди по его номеру. Пример: !remove <номер>")
 async def remove(ctx, index: int):
     """Удаляет трек из очереди по его номеру"""
     guild_id = ctx.guild.id
     if 0 < index <= len(song_queue[guild_id]):
         removed_song = song_queue[guild_id].pop(index - 1)
         await ctx.send(f"🗑 Удалено: {removed_song[1]}")
+
+@bot.command(name="clear", help="Очищает очередь треков.")
+async def clear(ctx):
+    """Очищает очередь треков"""
+    guild_id = ctx.guild.id
+    if guild_id in song_queue:
+        song_queue[guild_id] = []
+        await ctx.send("🧹 Очередь очищена!")
+    else:
+        await ctx.send("📭 Очередь уже пуста!")
 
 if __name__ == '__main__':
     bot.run(TOKEN)

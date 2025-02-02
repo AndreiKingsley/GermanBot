@@ -5,3 +5,4 @@ __pycache__
 downloads
 _token.py
 .DS_Store
+/music_bot.db
