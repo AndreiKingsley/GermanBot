@@ -10,6 +10,7 @@ import time
 from googleapiclient.discovery import build
 
 from _token import TOKEN, YOUTUBE_API_KEY  # Храни API-ключ в _token.py
+from views.search_result_view import SearchResultView
 
 # Global variables
 current_view = None
@@ -347,7 +348,14 @@ async def download_audio(url, guild_id):
         'nocheckcertificate': True,
         'ignoreerrors': False,
         'logtostderr': False,
-        'no_color': True
+        'no_color': True,
+        'socket_timeout': 30,
+        'http_headers': {
+            'Connection': 'close'  # Prevent connection reuse
+        },
+        'retries': 10,  # Number of retries for HTTP requests
+        'fragment_retries': 10,  # Number of retries for stream fragments
+        'retry_sleep': 3  # Time to sleep between retries
     }
 
     try:
@@ -430,8 +438,8 @@ async def play_next(ctx):
             stream_url, title, duration, thumbnail_url = await download_audio(url, guild_id)
 
         ffmpeg_options = {
-            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin',
-            'options': '-vn -filter:a volume=1.0'
+            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -timeout 30000000 -nostdin',
+            'options': '-vn -filter:a volume=1.0 -max_muxing_queue_size 1024'
         }
         source = discord.PCMVolumeTransformer(
             discord.FFmpegPCMAudio(stream_url, **ffmpeg_options),
@@ -501,14 +509,56 @@ def search_youtube(query):
         part="snippet",
         maxResults=5,
         type="video",
+        videoEmbeddable="true",
+        order="relevance",  # Sort by relevance
         safeSearch="none",
     ).execute()
 
+    video_ids = [item["id"]["videoId"] for item in search_response["items"]]
+
+    # Get detailed video information including duration
+    videos_response = youtube.videos().list(
+        part="contentDetails,statistics,snippet",
+        id=",".join(video_ids)
+    ).execute()
+
     results = []
-    for item in search_response["items"]:
-        video_id = item["id"]["videoId"]
-        title = item["snippet"]["title"]
-        results.append((title, f"https://www.youtube.com/watch?v={video_id}"))
+    for item in videos_response["items"]:
+        video_id = item["id"]
+        snippet = item["snippet"]
+        content_details = item["contentDetails"]
+
+        # Parse duration from ISO 8601 format
+        duration_str = content_details["duration"].replace("PT", "")
+        duration = ""
+        if "H" in duration_str:
+            hours, duration_str = duration_str.split("H")
+            duration += f"{hours}:"
+        if "M" in duration_str:
+            minutes, duration_str = duration_str.split("M")
+            duration += f"{int(minutes):02d}:"
+        if "S" in duration_str:
+            seconds = duration_str.replace("S", "")
+            duration += f"{int(seconds):02d}"
+        else:
+            duration += "00"
+
+        if ":" not in duration:
+            duration = f"0:{duration}"
+
+        # Filter out videos longer than 15 minutes
+        duration_parts = duration.split(":")
+        total_minutes = int(duration_parts[-2]) if len(duration_parts) > 1 else 0
+        if len(duration_parts) > 2:
+            total_minutes += int(duration_parts[0]) * 60
+
+        if total_minutes <= 15:
+            results.append({
+                "title": snippet["title"],
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "duration": duration,
+                "channel": snippet["channelTitle"]
+            })
 
     return results
 
@@ -727,30 +777,15 @@ async def play(ctx, *, query: str):
         else:
             await process_play(ctx, query)
     else:
+        # Поиск по текстовому запросу
         results = search_youtube(query)
         if not results:
             await ctx.send("❌ Ничего не найдено на YouTube.")
             return
 
-        # Создаем кнопки для выбора трека
-        view = discord.ui.View(timeout=30)
-        for i, (title, link) in enumerate(results):
-            button = discord.ui.Button(label=f"{i+1}. {title[:40]}", style=discord.ButtonStyle.primary, custom_id=link)
-
-            async def callback(interaction):
-                await interaction.response.defer()
-                await process_play(ctx, interaction.data["custom_id"])
-
-            button.callback = callback
-            view.add_item(button)
-
-        await ctx.send("🔎 Выберите один из найденных треков:", view=view)
-        return
-
-    if is_playlist(query):
-        await process_playlist(ctx, query)
-    else:
-        await process_play(ctx, query)
+        # Создаем и отображаем view с результатами поиска
+        view = SearchResultView(ctx, results)
+        await view.show_search_results()
 
 @bot.command(name="skip", aliases=["s"], help="Пропускает текущий трек.")
 async def skip(ctx):
