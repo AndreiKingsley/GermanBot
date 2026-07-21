@@ -316,6 +316,9 @@ song_queue = {}
 # Подключение к YouTube API
 youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 
+# Подключение к YouTube API
+youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
+
 # Проверка, является ли ссылка плейлистом и извлечение ID плейлиста
 def is_playlist(url):
     # Ищем параметр list= в URL
@@ -339,7 +342,7 @@ async def download_audio(url, guild_id):
     if current_view and not current_view.loop:
         current_view.stop_updates()
     ydl_opts = {
-        'format': '251/250/249/bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]/bestaudio',  # Prefer Opus, fallback to best available
+        'format': 'bestaudio[acodec=opus]/bestaudio/best',  # Prefer Opus, fallback to best available
         'quiet': True,
         'no_warnings': True,
         'extract_flat': 'in_playlist',
@@ -503,18 +506,27 @@ async def ensure_voice(ctx):
     return True
 
 # Функция поиска видео на YouTube
+MAX_SEARCH_RESULTS = 10  # Сколько вариантов показывать пользователю
+
 def search_youtube(query):
     search_response = youtube.search().list(
         q=query,
         part="snippet",
-        maxResults=5,
+        maxResults=25,  # Берём с запасом, часть отсеется фильтром по длительности
         type="video",
         videoEmbeddable="true",
         order="relevance",  # Sort by relevance
         safeSearch="none",
     ).execute()
 
-    video_ids = [item["id"]["videoId"] for item in search_response["items"]]
+    # Пропускаем элементы без videoId (каналы/плейлисты иногда проскакивают)
+    video_ids = [
+        item["id"]["videoId"]
+        for item in search_response["items"]
+        if item.get("id", {}).get("videoId")
+    ]
+    if not video_ids:
+        return []
 
     # Get detailed video information including duration
     videos_response = youtube.videos().list(
@@ -559,6 +571,9 @@ def search_youtube(query):
                 "duration": duration,
                 "channel": snippet["channelTitle"]
             })
+
+        if len(results) >= MAX_SEARCH_RESULTS:
+            break
 
     return results
 

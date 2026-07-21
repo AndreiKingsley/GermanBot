@@ -2,6 +2,8 @@ import discord
 from discord.ui import View, Button
 from typing import List, Dict
 
+NUMBER_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
 class SearchResultView(View):
     def __init__(self, ctx, results: List[Dict]):
         super().__init__(timeout=30)
@@ -33,13 +35,14 @@ class SearchResultView(View):
             await interaction.response.send_message("❌ Произошла ошибка при выборе трека.", ephemeral=True)
 
     def setup_buttons(self):
-        for i, result in enumerate(self.results):
-            # Create a button for each search result
+        # Ограничиваемся числом доступных эмодзи (до 10)
+        for i, result in enumerate(self.results[:len(NUMBER_EMOJIS)]):
+            # Create a button for each search result (по 5 кнопок в ряд)
             button = Button(
                 style=discord.ButtonStyle.primary,
-                emoji=["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"][i],
+                emoji=NUMBER_EMOJIS[i],
                 custom_id=str(i),
-                row=0
+                row=i // 5
             )
             button.callback = self.button_callback
             self.add_item(button)
@@ -55,9 +58,9 @@ class SearchResultView(View):
             if self.results:
                 # Create a clean list of all results
                 description = [embed.description, ""]  # Start with the initial description
-                for i, result in enumerate(self.results):
+                for i, result in enumerate(self.results[:len(NUMBER_EMOJIS)]):
                     title = result['title'][:70] + "..." if len(result['title']) > 70 else result['title']
-                    emoji = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"][i]
+                    emoji = NUMBER_EMOJIS[i]
                     description.append(
                         f"{emoji} **{title}**\n"
                         f"└ 📺 **{result['channel']}** ・ ⏱️ {result['duration']}\n"
