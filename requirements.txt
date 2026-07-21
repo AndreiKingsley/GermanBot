@@ -1,6 +1,5 @@
-discord.py>=2.7.1
-yt-dlp
-ffmpeg
+discord.py[voice]>=2.7.1
+davey>=0.1.6
+yt-dlp>=2026.7.4
 pynacl
 google-api-python-client
-discord
